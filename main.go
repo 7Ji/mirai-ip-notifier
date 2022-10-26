@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +18,95 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+/*  Handshake
+{
+	"syncId": "",
+	"data": {
+		"code": 0,
+		"session": "1BrU0vUN"
+	}
+}
+*/
+
+/*  FriendMessage
+{
+	"syncId": "-1",
+	"data": {
+		"type": "FriendMessage",
+		"messageChain":[
+			{
+				"type":"Source",
+				"id":56989,
+				"time":1666766438
+			},
+			{
+				"type":"Plain",
+				"text":"ip"
+			}
+		],
+		"sender":{
+			"id": 1069350749,
+			"nickname": "七",
+			"remark": "七"
+		}
+	}
+} */
+
+/* MessageConfirm success
+{
+	"syncId": "123",
+	"data": {
+		"code": 0,
+		"msg": "success",
+		"messageId":12800
+	}
+} */
+
+/* MessageConfirm fail
+{
+	"syncId": "123",
+	"data": {
+		"code": 5,
+		"msg": "指定对象不存在"
+	}
+} */
+
+/* BotOffline (drop)
+{
+	"syncId": "-1",
+	"data": {
+		"type": "BotOfflineEventDropped",
+		"qq": 2821314401
+	}
+} */
+
+/* BotOnline
+{
+	"syncId": "-1",
+	"data": {
+		"type": "BotOnlineEvent",
+		"qq": 2821314401
+	}
+} */
+
+/* BotRelogin
+{
+	"syncId": "-1",
+	"data": {
+		"type": "BotReloginEvent",
+		"qq": 2821314401
+	}
+} */
+
+/* BotOffline (exit)
+{
+	"syncId": "-1",
+	"data": {
+		"type": "BotOfflineEventActive",
+		"qq": 2821314401
+	}
+} */
+
 type MessageChainEntry struct {
 	Type string
 	Id   int
@@ -25,15 +115,18 @@ type MessageChainEntry struct {
 }
 
 type MessageSender struct {
-	Id       int
+	Id       int64
 	Nickname string
 	Remark   string
 }
 
 type MessageData struct {
 	Code         int
+	Msg          string
+	MessageId    int
 	Session      string
 	Type         string
+	QQ           int64
 	MessageChain []MessageChainEntry
 	Sender       MessageSender
 }
@@ -62,12 +155,19 @@ type MessageSend struct {
 func reader_json(done chan struct{}, conn *websocket.Conn, addrs *Addresses, target int64) {
 	var session string
 	var initialized bool = false
+	var pending []string
+	// var online bool = true
 	defer close(done)
 	for {
-		message := MessageReceive{}
-		err := conn.ReadJSON(&message)
+		_, msg_bytes, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Println("Failed to read message JSON", err)
+			fmt.Println("Failed to read message", err)
+		}
+		fmt.Println("Received message", string(msg_bytes))
+		message := MessageReceive{}
+		err = json.Unmarshal(msg_bytes, &message)
+		if err != nil {
+			fmt.Println("Failed to read message into JSON", err)
 			return
 		}
 		if message.SyncId == "" {
@@ -79,21 +179,46 @@ func reader_json(done chan struct{}, conn *websocket.Conn, addrs *Addresses, tar
 			initialized = true
 			session = message.Data.Session
 			fmt.Println("Handshake successful, session ID", session)
-		} else if message.Data.Type == "FriendMessage" && message.Data.Sender.Id == 1069350749 {
-			for _, msg := range message.Data.MessageChain {
-				if msg.Type == "Plain" {
-					fmt.Println("Received message from 7Ji:", msg.Text)
-					if msg.Text == "ip" {
-						fmt.Println("Responsing to command ip")
-						report := fmt.Sprintf("IPv4 public:\n%s\n\nIPv4 private:\n%s\n\nIPv6 link local:\n%s\n\nIPv6 local DHCP:\n%s\n\nIPv6 local SLAAC:\n%s\n\nIPv6 global DHCP:\n%s\n\nIPv6 global SLAAC:\n%s", addrs.v4_public_router, addrs.v4_private, addrs.v6_link_local, addrs.v6_local_dhcp, addrs.v6_local_slaac, addrs.v6_global_dhcp, addrs.v6_global_slaac)
-						err = conn.WriteJSON(send_helper(target, report))
-						if err != nil {
-							fmt.Println("Failed to response to command ip")
-							return
+		} else if message.SyncId == "-1" {
+			fmt.Println("Received active message sent by server, type", message.Data.Type)
+			switch message.Data.Type {
+			case "FriendMessage":
+				if message.Data.Sender.Id == target {
+					fmt.Println("Process message sent by", target)
+				} else {
+					fmt.Println("Ignore message sent by", message.Data.Sender.Id)
+				}
+			case "BotOfflineEventDropped":
+				fmt.Println("Bot offline for drop, waiting for online")
+
+			case "BotOnlineEvent":
+			case "BotReloginEvent":
+			case "BotOfflineEventActive":
+				fmt.Println("Bot")
+			default:
+				fmt.Println("Message/Event type not implemented yet:", message.Data.Type)
+			}
+
+			// fmt.Println(" - full message:", message)
+			if message.Data.Type == "FriendMessage" && message.Data.Sender.Id == 1069350749 {
+				for _, msg := range message.Data.MessageChain {
+					if msg.Type == "Plain" {
+						fmt.Println("Received message from 7Ji:", msg.Text)
+						if msg.Text == "ip" {
+							fmt.Println("Responsing to command ip")
+							report := fmt.Sprintf("IPv4 public:\n%s\n\nIPv4 private:\n%s\n\nIPv6 link local:\n%s\n\nIPv6 local DHCP:\n%s\n\nIPv6 local SLAAC:\n%s\n\nIPv6 global DHCP:\n%s\n\nIPv6 global SLAAC:\n%s", addrs.v4_public_router, addrs.v4_private, addrs.v6_link_local, addrs.v6_local_dhcp, addrs.v6_local_slaac, addrs.v6_global_dhcp, addrs.v6_global_slaac)
+							err = conn.WriteJSON(send_helper(target, report))
+							if err != nil {
+								fmt.Println("Failed to response to command ip")
+								return
+							}
 						}
 					}
 				}
 			}
+		} else {
+			fmt.Println("Received passive message for confimation, syncId", message.SyncId)
+
 		}
 	}
 }
@@ -261,7 +386,7 @@ func main() {
 		return
 	}
 	defer listener_router.Close()
-	url := url.URL{Scheme: "ws", Host: *mirai_host, Path: "/message"}
+	url := url.URL{Scheme: "ws", Host: *mirai_host, Path: "/all"}
 	url_string := url.String()
 	fmt.Printf("Connecting to mirai on WS path '%s', with key '%s', source QQ '%s', target QQ '%s'\n", url_string, *mirai_key, *mirai_source, *mirai_target)
 	header := make(http.Header)
