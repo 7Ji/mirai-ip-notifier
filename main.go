@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -152,11 +153,17 @@ type MessageSend struct {
 	Content    MessageContent `json:"content"`
 }
 
-func reader_json(done chan struct{}, conn *websocket.Conn, addrs *Addresses, target int64) {
-	var session string
-	var initialized bool = false
-	var pending []string
-	// var online bool = true
+type MiraiConf struct {
+	SourceString string
+	SourceLong   int64
+	SourceUlong  uint64
+	TargetString string
+	TargetLong   int64
+	TargetUlong  uint64
+	Session      string
+}
+
+func reader(done chan struct{}, conn *websocket.Conn, addrs *Addresses, mconf *MiraiConf, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex) {
 	defer close(done)
 	for {
 		_, msg_bytes, err := conn.ReadMessage()
@@ -171,57 +178,69 @@ func reader_json(done chan struct{}, conn *websocket.Conn, addrs *Addresses, tar
 			return
 		}
 		if message.SyncId == "" {
-			fmt.Println("Special message, first handshake")
-			if initialized {
-				fmt.Println("Error: double initialization")
-				return
-			}
-			initialized = true
-			session = message.Data.Session
-			fmt.Println("Handshake successful, session ID", session)
+			fmt.Println("Error: double initialization")
+			return
 		} else if message.SyncId == "-1" {
 			fmt.Println("Received active message sent by server, type", message.Data.Type)
 			switch message.Data.Type {
 			case "FriendMessage":
-				if message.Data.Sender.Id == target {
-					fmt.Println("Process message sent by", target)
+				if message.Data.Sender.Id == mconf.TargetLong {
+					fmt.Println("Process message sent by", mconf.TargetLong)
+					for _, msg := range message.Data.MessageChain {
+						if msg.Type == "Plain" {
+							fmt.Println("Received message from 7Ji:", msg.Text)
+							if msg.Text == "ip" {
+								fmt.Println("Responsing to command ip")
+								report := fmt.Sprintf("IPv4 public:\n%s\n\nIPv4 private:\n%s\n\nIPv6 link local:\n%s\n\nIPv6 local DHCP:\n%s\n\nIPv6 local SLAAC:\n%s\n\nIPv6 global DHCP:\n%s\n\nIPv6 global SLAAC:\n%s", addrs.v4_public_router, addrs.v4_private, addrs.v6_link_local, addrs.v6_local_dhcp, addrs.v6_local_slaac, addrs.v6_global_dhcp, addrs.v6_global_slaac)
+								go send_message(conn, mconf, report, syncIdHighest, queue, mx_id, mx_pending)
+							}
+						}
+					}
 				} else {
 					fmt.Println("Ignore message sent by", message.Data.Sender.Id)
 				}
 			case "BotOfflineEventDropped":
 				fmt.Println("Bot offline for drop, waiting for online")
-
 			case "BotOnlineEvent":
 			case "BotReloginEvent":
 			case "BotOfflineEventActive":
-				fmt.Println("Bot")
+				fmt.Println("Bot offline active, existing")
+				return
 			default:
 				fmt.Println("Message/Event type not implemented yet:", message.Data.Type)
 			}
-
-			// fmt.Println(" - full message:", message)
-			if message.Data.Type == "FriendMessage" && message.Data.Sender.Id == 1069350749 {
-				for _, msg := range message.Data.MessageChain {
-					if msg.Type == "Plain" {
-						fmt.Println("Received message from 7Ji:", msg.Text)
-						if msg.Text == "ip" {
-							fmt.Println("Responsing to command ip")
-							report := fmt.Sprintf("IPv4 public:\n%s\n\nIPv4 private:\n%s\n\nIPv6 link local:\n%s\n\nIPv6 local DHCP:\n%s\n\nIPv6 local SLAAC:\n%s\n\nIPv6 global DHCP:\n%s\n\nIPv6 global SLAAC:\n%s", addrs.v4_public_router, addrs.v4_private, addrs.v6_link_local, addrs.v6_local_dhcp, addrs.v6_local_slaac, addrs.v6_global_dhcp, addrs.v6_global_slaac)
-							err = conn.WriteJSON(send_helper(target, report))
-							if err != nil {
-								fmt.Println("Failed to response to command ip")
-								return
-							}
-						}
-					}
-				}
-			}
 		} else {
 			fmt.Println("Received passive message for confimation, syncId", message.SyncId)
-
+			syncId_uint, err := strconv.ParseUint(message.SyncId, 10, 32)
+			if err != nil {
+				fmt.Println("Failed to convert syncId to uint")
+				return
+			}
+			msg_sync, ok := queue[uint(syncId_uint)]
+			if ok {
+				if message.Data.Code == 0 {
+					fmt.Println("Confirmed message sent success", message.SyncId)
+					msg_sync <- true
+				} else {
+					fmt.Println("Confirmed message failed to send", message.SyncId)
+					msg_sync <- false
+				}
+			} else {
+				// Maybe this can be ignored?
+				fmt.Println("SyncID is not in queue yet mirai sent its completion, ignore that", message.SyncId)
+				// return
+			}
 		}
 	}
 }
+
+// func request_list(conn *websocket.Conn) {
+// 	for {
+// 		msg := `{"syncId":233,"command":"botList","subCommand":null,"content":{}}`
+// 		conn.WriteMessage(websocket.TextMessage, []byte(msg))
+// 		time.Sleep(time.Second)
+// 	}
+// }
 
 type Addresses struct {
 	v4_private       string
@@ -349,74 +368,141 @@ func update_addresses(iface *net.Interface, addrs *Addresses) (report string) {
 	return report
 }
 
-func send_helper(target int64, msg string) MessageSend {
-	msg_s := MessageSend{
-		SyncId:  123,
-		Command: "sendFriendMessage",
-		Content: MessageContent{
-			Target: target,
-			MessageChain: []MessageChainEntryPlain{
-				{
-					Type: "Plain",
-					Text: msg,
+// func send_helper(target int64, msg string) MessageSend {
+// 	msg_s := MessageSend{
+// 		SyncId:  123,
+// 		Command: "sendFriendMessage",
+// 		Content: MessageContent{
+// 			Target: target,
+// 			MessageChain: []MessageChainEntryPlain{
+// 				{
+// 					Type: "Plain",
+// 					Text: msg,
+// 				},
+// 			},
+// 		},
+// 	}
+// 	return msg_s
+// }
+
+func send_message(conn *websocket.Conn, mconf *MiraiConf, text string, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex) {
+	for {
+		mx_id.Lock()
+		syncId := *syncIdHighest
+		*syncIdHighest++
+		mx_id.Unlock()
+		fmt.Println("Sending message", syncId)
+		// syncIdString := fmt.Sprintln(syncIdInt)
+		msg := MessageSend{
+			SyncId:  int(syncId),
+			Command: "sendFriendMessage",
+			Content: MessageContent{
+				Target: mconf.TargetLong,
+				MessageChain: []MessageChainEntryPlain{
+					{
+						Type: "Plain",
+						Text: text,
+					},
 				},
 			},
-		},
+		}
+		err := conn.WriteJSON(&msg)
+		if err != err {
+			fmt.Println("Failed to send message", syncId, err)
+		}
+		mx_pending.Lock()
+		queue[syncId] = make(chan bool)
+		mx_pending.Unlock()
+		r := <-queue[syncId]
+		close(queue[syncId])
+		mx_pending.Lock()
+		delete(queue, syncId)
+		mx_pending.Unlock()
+		if r {
+			fmt.Println("Message sent successfully", syncId)
+			return
+		} else {
+			fmt.Println("Failed to send message, retrying", syncId)
+		}
 	}
-	return msg_s
 }
 
 func main() {
-	mirai_host := flag.String("host", "localhost:8080", "hostname path to connect to")
-	mirai_key := flag.String("key", "S7hpii8TFQmIZjuI9rIp", "verifyKey to be used")
-	mirai_source := flag.String("source", "2821314401", "source QQ bot to be used")
-	mirai_target := flag.String("target", "1069350749", "target QQ to send messeage to")
-	listen := flag.String("listen", ":7777", "[host:]port to listen router report on")
-	iface_name := flag.String("iface", "eth0", "interface to get IP from")
+	flag_host := flag.String("host", "localhost:8080", "hostname path to connect to")
+	flag_key := flag.String("key", "S7hpii8TFQmIZjuI9rIp", "verifyKey to be used")
+	flag_source := flag.Uint64("source", 2821314401, "source QQ bot to be used")
+	flag_target := flag.Uint64("target", 1069350749, "target QQ to send messeage to")
+	flag_listen := flag.String("listen", ":7777", "[host:]port to listen router report on")
+	flag_iface := flag.String("iface", "eth0", "interface to get IP from")
 	flag.Parse()
-	target, _ := strconv.ParseInt(*mirai_target, 10, 64)
-	iface, err := net.InterfaceByName(*iface_name)
+	mconf := MiraiConf{
+		SourceString: fmt.Sprintln(*flag_source),
+		SourceLong:   int64(*flag_source),
+		SourceUlong:  *flag_source,
+		TargetString: fmt.Sprintln(*flag_target),
+		TargetLong:   int64(*flag_target),
+		TargetUlong:  *flag_target,
+	}
+	iface, err := net.InterfaceByName(*flag_iface)
 	if err != nil {
-		fmt.Println("Failed to get interface with name", *iface_name)
+		fmt.Println("Failed to get interface with name", *flag_iface)
 		return
 	}
-	listener_router, err := net.Listen("tcp", *listen)
+	listener_router, err := net.Listen("tcp", *flag_listen)
 	if err != nil {
 		fmt.Println("Failed to listen router IP report", err)
 		return
 	}
 	defer listener_router.Close()
-	url := url.URL{Scheme: "ws", Host: *mirai_host, Path: "/all"}
+	url := url.URL{Scheme: "ws", Host: *flag_host, Path: "/all"}
 	url_string := url.String()
-	fmt.Printf("Connecting to mirai on WS path '%s', with key '%s', source QQ '%s', target QQ '%s'\n", url_string, *mirai_key, *mirai_source, *mirai_target)
-	header := make(http.Header)
-	header.Add("verifyKey", *mirai_key)
-	header.Add("qq", *mirai_source)
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	fmt.Println("Connecting to mirai at", url_string)
+	// fmt.Printf("Connecting to mirai on WS path '%s', with key '%s', source QQ '%s', target QQ '%s'\n", url_string, *flag_key, *flag_source, *flag_target)
+	header := http.Header{}
+	header.Add("verifyKey", *flag_key)
+	header.Add("qq", mconf.SourceString)
 	connection, _, err := websocket.DefaultDialer.Dial(url_string, header)
 	if err != nil {
-		fmt.Println("Failed to connect, quiting")
+		fmt.Println("Failed to connect to mirai, quiting")
 		return
 	}
 	defer connection.Close()
-	var addrs Addresses
-	update := update_addresses(iface, &addrs)
-	go listener(&listener_router, &addrs)
-	if len(update) > 0 {
-		msg := send_helper(target, update)
-		err = connection.WriteJSON(msg)
-		if err != nil {
-			fmt.Println("Failed to write test message", err)
-			return
-		}
+	_, msg, err := connection.ReadMessage()
+	fmt.Println("Handshake message:", string(msg))
+	msg_recv := MessageReceive{}
+	err = json.Unmarshal(msg, &msg_recv)
+	if err != nil {
+		fmt.Println("Failed to read session message, quiting")
+		return
+	}
+	if msg_recv.SyncId == "" && msg_recv.Data.Code == 0 {
+		mconf.Session = msg_recv.Data.Session
+	} else {
+		fmt.Println("Failed to get session, quiting")
+		return
 	}
 	fmt.Println("Connection successful")
+	addrs := Addresses{}
+	// update := update_addresses(iface, &addrs)
+	go listener(&listener_router, &addrs)
+	// if len(update) > 0 {
+	// 	msg := send_helper(target, update)
+	// 	err = connection.WriteJSON(msg)
+	// 	if err != nil {
+	// 		fmt.Println("Failed to write test message", err)
+	// 		return
+	// 	}
+	// }
+	var sync_id_highest uint = 100
+	var mx_id, mx_pending sync.Mutex
+	queue := make(map[uint](chan bool))
 	done := make(chan struct{})
-	go reader_json(done, connection, &addrs, target)
+	go reader(done, connection, &addrs, &mconf, &sync_id_highest, queue, &mx_id, &mx_pending)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	// go request_list(connection)
 	for {
 		select {
 		case <-done:
@@ -425,14 +511,15 @@ func main() {
 		case <-ticker.C:
 			// fmt.Println("Periodical check at", t)
 			// fmt.Println("Periodical check")
-			update = update_addresses(iface, &addrs)
+			update := update_addresses(iface, &addrs)
 			if len(update) > 0 {
-				msg := send_helper(target, update)
-				err = connection.WriteJSON(msg)
-				if err != nil {
-					fmt.Println("Failed to write test message", err)
-					return
-				}
+				go send_message(connection, &mconf, update, &sync_id_highest, queue, &mx_id, &mx_pending)
+				// msg := send_helper(target, update)
+				// err = connection.WriteJSON(msg)
+				// if err != nil {
+				// 	fmt.Println("Failed to write test message", err)
+				// 	return
+				// }
 			}
 		case <-interrupt:
 			log.Println("interrupt received, wait for others")
