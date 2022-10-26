@@ -163,7 +163,7 @@ type MiraiConf struct {
 	Session      string
 }
 
-func reader(done chan struct{}, conn *websocket.Conn, addrs *Addresses, mconf *MiraiConf, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex) {
+func reader(done chan struct{}, conn *websocket.Conn, addrs *Addresses, mconf *MiraiConf, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex, online *bool) {
 	defer close(done)
 	for {
 		_, msg_bytes, err := conn.ReadMessage()
@@ -189,10 +189,16 @@ func reader(done chan struct{}, conn *websocket.Conn, addrs *Addresses, mconf *M
 					for _, msg := range message.Data.MessageChain {
 						if msg.Type == "Plain" {
 							fmt.Println("Received message from 7Ji:", msg.Text)
-							if msg.Text == "ip" {
-								fmt.Println("Responsing to command ip")
+							switch msg.Text {
+							case "ip":
+								fmt.Println("Responsing to command ip (ip summary)")
 								report := fmt.Sprintf("IPv4 public:\n%s\n\nIPv4 private:\n%s\n\nIPv6 link local:\n%s\n\nIPv6 local DHCP:\n%s\n\nIPv6 local SLAAC:\n%s\n\nIPv6 global DHCP:\n%s\n\nIPv6 global SLAAC:\n%s", addrs.v4_public_router, addrs.v4_private, addrs.v6_link_local, addrs.v6_local_dhcp, addrs.v6_local_slaac, addrs.v6_global_dhcp, addrs.v6_global_slaac)
-								go send_message(conn, mconf, report, syncIdHighest, queue, mx_id, mx_pending)
+								go send_message(conn, mconf, report, syncIdHighest, queue, mx_id, mx_pending, online)
+							case "hi":
+								fmt.Println("Responsing to command hi (say hi)")
+								go send_message(conn, mconf, "hello", syncIdHighest, queue, mx_id, mx_pending, online)
+							default:
+								go send_message(conn, mconf, "only ip/hi are supported", syncIdHighest, queue, mx_id, mx_pending, online)
 							}
 						}
 					}
@@ -201,8 +207,13 @@ func reader(done chan struct{}, conn *websocket.Conn, addrs *Addresses, mconf *M
 				}
 			case "BotOfflineEventDropped":
 				fmt.Println("Bot offline for drop, waiting for online")
+				*online = false
 			case "BotOnlineEvent":
+				fmt.Println("Bot online again")
+				*online = true
 			case "BotReloginEvent":
+				fmt.Println("Bot relogin")
+				*online = true
 			case "BotOfflineEventActive":
 				fmt.Println("Bot offline active, existing")
 				return
@@ -385,13 +396,17 @@ func update_addresses(iface *net.Interface, addrs *Addresses) (report string) {
 // 	return msg_s
 // }
 
-func send_message(conn *websocket.Conn, mconf *MiraiConf, text string, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex) {
+func send_message(conn *websocket.Conn, mconf *MiraiConf, text string, syncIdHighest *uint, queue map[uint](chan bool), mx_id *sync.Mutex, mx_pending *sync.Mutex, online *bool) {
 	for {
 		mx_id.Lock()
 		syncId := *syncIdHighest
 		*syncIdHighest++
 		mx_id.Unlock()
 		fmt.Println("Sending message", syncId)
+		for !(*online) {
+			fmt.Println("Waiting for online, message halted", syncId)
+			time.Sleep(time.Second)
+		}
 		// syncIdString := fmt.Sprintln(syncIdInt)
 		msg := MessageSend{
 			SyncId:  int(syncId),
@@ -461,10 +476,18 @@ func main() {
 	header := http.Header{}
 	header.Add("verifyKey", *flag_key)
 	header.Add("qq", mconf.SourceString)
-	connection, _, err := websocket.DefaultDialer.Dial(url_string, header)
+	var connection *websocket.Conn
+	for i := 1; i < 4; i++ {
+		connection, _, err = websocket.DefaultDialer.Dial(url_string, header)
+		if err == nil {
+			break
+		} else {
+			fmt.Println("Failed to connect to mirai on try", i, "of", 3, err)
+			time.Sleep(time.Second * 5)
+		}
+	}
 	if err != nil {
-		fmt.Println("Failed to connect to mirai, quiting")
-		return
+		fmt.Println("Failed to connect to mirai after 3 times, give up", err)
 	}
 	defer connection.Close()
 	_, msg, err := connection.ReadMessage()
@@ -497,7 +520,8 @@ func main() {
 	var mx_id, mx_pending sync.Mutex
 	queue := make(map[uint](chan bool))
 	done := make(chan struct{})
-	go reader(done, connection, &addrs, &mconf, &sync_id_highest, queue, &mx_id, &mx_pending)
+	online := true
+	go reader(done, connection, &addrs, &mconf, &sync_id_highest, queue, &mx_id, &mx_pending, &online)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	interrupt := make(chan os.Signal, 1)
@@ -513,7 +537,7 @@ func main() {
 			// fmt.Println("Periodical check")
 			update := update_addresses(iface, &addrs)
 			if len(update) > 0 {
-				go send_message(connection, &mconf, update, &sync_id_highest, queue, &mx_id, &mx_pending)
+				go send_message(connection, &mconf, update, &sync_id_highest, queue, &mx_id, &mx_pending, &online)
 				// msg := send_helper(target, update)
 				// err = connection.WriteJSON(msg)
 				// if err != nil {
