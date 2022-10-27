@@ -264,40 +264,69 @@ type Addresses struct {
 	v6_global_slaac  string
 }
 
-func listener_process(c *net.Conn, addrs *Addresses) {
-	defer (*c).Close()
+// func listener_process(c *net.Conn, addrs *Addresses) {
+// 	defer (*c).Close()
+// 	for {
+// 		netData, err := bufio.NewReader(*c).ReadString('\n')
+// 		if err != nil {
+// 			if err.Error() == "EOF" {
+// 				fmt.Println("Router message ends")
+// 			} else {
+// 				fmt.Println("Failed to process router message", err)
+// 			}
+// 			return
+// 		}
+// 		if strings.TrimSpace(string(netData)) == "STOP" {
+// 			fmt.Println("Exiting TCP server!")
+// 			return
+// 		}
+// 		// fmt.Print("-> ", string(netData))
+// 		addrs.v4_public_router = strings.TrimRight(string(netData), "\n")
+// 		t := time.Now()
+// 		myTime := t.Format(time.RFC3339) + "\n"
+// 		(*c).Write([]byte(myTime))
+// 	}
+// }
+
+// func listener(l *net.Listener, addrs *Addresses) {
+// 	// defer (*l).Close()
+// 	for {
+// 		c, err := (*l).Accept()
+// 		if err != nil {
+// 			fmt.Println("Failed to accept TCP incoming stream, ", err)
+// 			return
+// 		}
+// 		go listener_process(&c, addrs)
+// 	}
+// }
+
+func router_updater(router string, addrs *Addresses) {
 	for {
-		netData, err := bufio.NewReader(*c).ReadString('\n')
+		conn, err := net.Dial("tcp", router)
 		if err != nil {
-			if err.Error() == "EOF" {
-				fmt.Println("Router message ends")
+			fmt.Println("Failed to dail to router at", router, err, "wait for 10 seconds to redial")
+		} else {
+			defer conn.Close()
+			data, err := bufio.NewReader(conn).ReadString('\n')
+			if err != nil {
+				fmt.Println("Failed read router message", err)
 			} else {
-				fmt.Println("Failed to process router message", err)
+				// fmt.Println("Read router message:", data)
+				addrs.v4_public_router = strings.TrimSpace(data)
 			}
-			return
 		}
-		if strings.TrimSpace(string(netData)) == "STOP" {
-			fmt.Println("Exiting TCP server!")
-			return
-		}
-		// fmt.Print("-> ", string(netData))
-		addrs.v4_public_router = strings.TrimRight(string(netData), "\n")
-		t := time.Now()
-		myTime := t.Format(time.RFC3339) + "\n"
-		(*c).Write([]byte(myTime))
+		time.Sleep(time.Second)
 	}
 }
 
-func listener(l *net.Listener, addrs *Addresses) {
-	// defer (*l).Close()
-	for {
-		c, err := (*l).Accept()
-		if err != nil {
-			fmt.Println("Failed to accept TCP incoming stream, ", err)
-			return
-		}
-		go listener_process(&c, addrs)
-	}
+type UpdateStatus struct {
+	// v4_public       bool
+	v4_private      bool
+	v6_link_local   bool
+	v6_local_dhcp   bool
+	v6_local_slaac  bool
+	v6_global_dhcp  bool
+	v6_global_slaac bool
 }
 
 func update_addresses(iface *net.Interface, addrs *Addresses) (report string) {
@@ -308,6 +337,7 @@ func update_addresses(iface *net.Interface, addrs *Addresses) (report string) {
 	}
 	report = ""
 	start := false
+	status := UpdateStatus{}
 	if addrs.v4_public_router != addrs.v4_public_report {
 		report += fmt.Sprintf("v4 public updated:\n%s", addrs.v4_public_router)
 		addrs.v4_public_report = addrs.v4_public_router
@@ -317,61 +347,67 @@ func update_addresses(iface *net.Interface, addrs *Addresses) (report string) {
 		// fmt.Println(addr)
 		addr_str := addr.String()
 		if strings.HasPrefix(addr_str, "192.168.") {
-			if addrs.v4_private != addr_str {
+			if !status.v4_private && addrs.v4_private != addr_str {
 				if start {
 					report += "\n\n"
 				}
 				report += fmt.Sprintf("v4 private updated:\n%s", addr_str)
 				addrs.v4_private = addr_str
 				start = true
+				status.v4_private = true
 			}
 		} else if strings.HasPrefix(addr_str, "fe80:") {
-			if addrs.v6_link_local != addr_str {
+			if !status.v6_link_local && addrs.v6_link_local != addr_str {
 				if start {
 					report += "\n\n"
 				}
 				report += fmt.Sprintf("v6 link-local updated:\n%s", addr_str)
 				addrs.v6_link_local = addr_str
 				start = true
+				status.v6_link_local = true
 			}
 		} else if strings.HasPrefix(addr_str, "fdb5:") {
-			if strings.HasSuffix(addr_str, "/128") {
-				if addrs.v6_local_dhcp != addr_str {
+			if !status.v6_local_dhcp {
+				if strings.HasSuffix(addr_str, "/128") && addrs.v6_local_dhcp != addr_str {
 					if start {
 						report += "\n\n"
 					}
 					report += fmt.Sprintf("v6 local dhcp updated:\n%s", addr_str)
 					addrs.v6_local_dhcp = addr_str
 					start = true
+					status.v6_local_dhcp = true
 				}
-			} else if strings.HasSuffix(addr_str, "/64") {
-				if addrs.v6_local_slaac != addr_str {
+			} else if !status.v6_local_slaac {
+				if strings.HasSuffix(addr_str, "/64") && addrs.v6_local_slaac != addr_str {
 					if start {
 						report += "\n\n"
 					}
 					report += fmt.Sprintf("v6 local slaac updated:\n%s", addr_str)
 					addrs.v6_local_slaac = addr_str
 					start = true
+					status.v6_local_slaac = true
 				}
 			}
 		} else {
-			if strings.HasSuffix(addr_str, "/128") {
-				if addrs.v6_global_dhcp != addr_str {
+			if !status.v6_global_dhcp {
+				if strings.HasSuffix(addr_str, "/128") && addrs.v6_global_dhcp != addr_str {
 					if start {
 						report += "\n\n"
 					}
 					report += fmt.Sprintf("v6 global dhcp updated:\n%s", addr_str)
 					addrs.v6_global_dhcp = addr_str
 					start = true
+					status.v6_global_dhcp = true
 				}
-			} else if strings.HasSuffix(addr_str, "/64") {
-				if addrs.v6_global_slaac != addr_str {
+			} else if !status.v6_global_slaac {
+				if strings.HasSuffix(addr_str, "/64") && addrs.v6_global_slaac != addr_str {
 					if start {
 						report += "\n\n"
 					}
 					report += fmt.Sprintf("v6 global slaac updated:\n%s", addr_str)
 					addrs.v6_global_slaac = addr_str
 					start = true
+					status.v6_global_dhcp = true
 				}
 			}
 		}
@@ -447,7 +483,7 @@ func main() {
 	flag_key := flag.String("key", "S7hpii8TFQmIZjuI9rIp", "verifyKey to be used")
 	flag_source := flag.Uint64("source", 2821314401, "source QQ bot to be used")
 	flag_target := flag.Uint64("target", 1069350749, "target QQ to send messeage to")
-	flag_listen := flag.String("listen", ":7777", "[host:]port to listen router report on")
+	flag_router := flag.String("router", "192.168.7.1:7777", "[host:]port to get router ip report from")
 	flag_iface := flag.String("iface", "eth0", "interface to get IP from")
 	flag.Parse()
 	mconf := MiraiConf{
@@ -463,12 +499,13 @@ func main() {
 		fmt.Println("Failed to get interface with name", *flag_iface)
 		return
 	}
-	listener_router, err := net.Listen("tcp", *flag_listen)
-	if err != nil {
-		fmt.Println("Failed to listen router IP report", err)
-		return
-	}
-	defer listener_router.Close()
+	// net.Dial("tcp")
+	// listener_router, err := net.Listen("tcp", *flag_listen)
+	// if err != nil {
+	// 	fmt.Println("Failed to listen router IP report", err)
+	// 	return
+	// }
+	// defer listener_router.Close()
 	url := url.URL{Scheme: "ws", Host: *flag_host, Path: "/all"}
 	url_string := url.String()
 	fmt.Println("Connecting to mirai at", url_string)
@@ -506,8 +543,9 @@ func main() {
 	}
 	fmt.Println("Connection successful")
 	addrs := Addresses{}
+	go router_updater(*flag_router, &addrs)
 	// update := update_addresses(iface, &addrs)
-	go listener(&listener_router, &addrs)
+	// go listener(&listener_router, &addrs)
 	// if len(update) > 0 {
 	// 	msg := send_helper(target, update)
 	// 	err = connection.WriteJSON(msg)
@@ -537,6 +575,8 @@ func main() {
 			// fmt.Println("Periodical check")
 			update := update_addresses(iface, &addrs)
 			if len(update) > 0 {
+				// fmt.Println("IP updated, need report")
+				// fmt.Print(update)
 				go send_message(connection, &mconf, update, &sync_id_highest, queue, &mx_id, &mx_pending, &online)
 				// msg := send_helper(target, update)
 				// err = connection.WriteJSON(msg)
