@@ -1,0 +1,74 @@
+{
+    "Handshake": {
+        "syncId": "",
+        "data": {
+            "code": 0,
+            "session": "1BrU0vUN"
+        }
+    },
+    "FriendMessage": {
+        "syncId": "-1",
+        "data": {
+            "type": "FriendMessage",
+            "messageChain":[
+                {
+                    "type":"Source",
+                    "id":56989,
+                    "time":1666766438
+                },
+                {
+                    "type":"Plain",
+                    "text":"ip"
+                }
+            ],
+            "sender":{
+                "id": 1069350749,
+                "nickname": "七",
+                "remark": "七"
+            }
+        }
+    },
+    "MessageConfirm success": {
+        "syncId": "123",
+        "data": {
+            "code": 0,
+            "msg": "success",
+            "messageId":12800
+        }
+    },
+    "MessageConfirm fail": {
+        "syncId": "123",
+        "data": {
+            "code": 5,
+            "msg": "指定对象不存在"
+        }
+    },
+    "BotOffline (drop)": {
+        "syncId": "-1",
+        "data": {
+            "type": "BotOfflineEventDropped",
+            "qq": 2821314401
+        }
+    },
+    "BotOnline": {
+        "syncId": "-1",
+        "data": {
+            "type": "BotOnlineEvent",
+            "qq": 2821314401
+        }
+    },
+    "BotRelogin": {
+        "syncId": "-1",
+        "data": {
+            "type": "BotReloginEvent",
+            "qq": 2821314401
+        }
+    },
+    "BotOffline (exit)": {
+        "syncId": "-1",
+        "data": {
+            "type": "BotOfflineEventActive",
+            "qq": 2821314401
+        }
+    }
+}
